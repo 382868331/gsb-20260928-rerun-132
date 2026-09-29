@@ -1,0 +1,112 @@
+// Package semantic builds symbol identity and lexical resolution on top of the
+// immutable syntax objects. Symbols are deliberately separate from syntax
+// nodes: a symbol survives re-parses and edits, while ranges belong to a
+// specific document version.
+package semantic
+
+import "sync"
+
+// Kind classifies a symbol.
+type Kind int
+
+const (
+	KindUnknown Kind = iota
+	KindFunc
+	KindVar
+)
+
+func (k Kind) String() string {
+	switch k {
+	case KindFunc:
+		return "func"
+	case KindVar:
+		return "var"
+	default:
+		return "unknown"
+	}
+}
+
+// Symbol is the stable identity of one declaration. ID is unique within a
+// session; identity keys (global name or lexical path) map onto exactly one
+// Symbol for the session lifetime.
+type Symbol struct {
+	ID   uint64 `json:"id"`
+	Kind Kind   `json:"kind"`
+	Name string `json:"name"`
+
+	// LocalKey is empty for global symbols. For locals it encodes file +
+	// lexical nesting path + name, so two same-named locals in different
+	// scopes never share identity.
+	LocalKey string `json:"localKey,omitempty"`
+}
+
+// Registry owns the session-wide symbol table and ID allocation.
+type Registry struct {
+	mu      sync.Mutex
+	nextID  uint64
+	globals map[string]*Symbol // name -> stable identity (whole project)
+	locals  map[string]*Symbol // localKey -> stable identity
+}
+
+// NewRegistry creates an empty registry.
+func NewRegistry() *Registry {
+	return &Registry{
+		globals: make(map[string]*Symbol),
+		locals:  make(map[string]*Symbol),
+	}
+}
+
+// Global returns the stable global symbol for name, creating it on first use.
+func (r *Registry) Global(name string, kind Kind) *Symbol {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if s, ok := r.globals[name]; ok {
+		if s.Kind == KindUnknown {
+			s.Kind = kind
+		}
+		return s
+	}
+	r.nextID++
+	s := &Symbol{ID: r.nextID, Kind: kind, Name: name}
+	r.globals[name] = s
+	return s
+}
+
+// GlobalExisting returns the global symbol if it has ever been registered.
+func (r *Registry) GlobalExisting(name string) (*Symbol, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.globals[name]
+	return s, ok
+}
+
+// PruneGlobals drops global identities whose names are not in live, so names
+// removed from the current snapshot stop resolving in other files. A name
+// reintroduced later is allocated a fresh identity.
+func (r *Registry) PruneGlobals(live map[string]bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for name := range r.globals {
+		if !live[name] {
+			delete(r.globals, name)
+		}
+	}
+}
+
+// Local returns the stable local symbol for a lexical identity key.
+func (r *Registry) Local(key, name string, kind Kind) *Symbol {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if s, ok := r.locals[key]; ok {
+		return s
+	}
+	r.nextID++
+	s := &Symbol{ID: r.nextID, Kind: kind, Name: name, LocalKey: key}
+	r.locals[key] = s
+	return s
+}
+
+// LocalKey builds the identity key of a local declaration.
+func LocalKey(uri, scopePath, name string) string {
+	return uri + "|" + scopePath + "|" + name
+}
