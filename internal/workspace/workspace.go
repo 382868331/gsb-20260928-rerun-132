@@ -80,8 +80,10 @@ type Workspace struct {
 	mu        sync.Mutex
 	snap      *snapshot.Snapshot
 	nextSnap  int64
+	nextPlan  int64
 	reg       *semantic.Registry
 	files     map[snapshot.URI]*fileState
+	plans     map[int64]*renamePlanState
 	parseErrs map[snapshot.URI]error
 }
 
@@ -89,8 +91,10 @@ type Workspace struct {
 func New() *Workspace {
 	return &Workspace{
 		nextSnap:  1,
+		nextPlan:  1,
 		reg:       semantic.NewRegistry(),
 		files:     make(map[snapshot.URI]*fileState),
+		plans:     make(map[int64]*renamePlanState),
 		parseErrs: make(map[snapshot.URI]error),
 	}
 }
@@ -399,6 +403,15 @@ func (w *Workspace) Status() StatusResult {
 
 // ParseError returns the current syntax error for a file, if any.
 func (w *Workspace) ParseError(uri snapshot.URI) error { return w.parseErrs[uri] }
+
+// DocumentText returns the current session text of a document, including
+// unsaved overlays.
+func (w *Workspace) DocumentText(uri snapshot.URI) (string, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	doc, ok := w.snapshot().Get(uri)
+	return doc.Text, ok
+}
 
 // Diagnostics returns semantic diagnostics reported for one document.
 func (w *Workspace) Diagnostics(uri snapshot.URI) []semantic.Diagnostic {

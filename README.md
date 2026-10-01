@@ -4,6 +4,8 @@
 
 - 跨文件 **定义跳转（definition）**
 - 跨文件 **引用定位（references）**
+ 带预览的跨文件 **重命名（rename）**：先预览绑定到目标符号的全部出现点，
+  再原子落盘；预览后相关文档一旦变化，旧方案会被拒绝而不是按旧偏移写坏新源码
 
 它不是代码片段管理器：存储的是版本化的工程快照、语法对象和符号身份，
 后续补全/重命名等能力直接建立在此基础上。
@@ -28,7 +30,13 @@
 - **局部身份**：局部符号 key = `文件URI | 词法路径 | 名字:声明字节偏移`，
   不同文件/不同函数里的同名局部变量天然隔离。
 - **未保存改动**：`/edit` 以 overlay 进入当前会话快照（`saved:false`），查询立即
-  反映新文本；`/save` 只翻转已保存标记。
+ 反映新文本；`/save` 只翻转已保存标记。
+ **两阶段重命名**：`/rename/prepare` 只收集**绑定到目标符号**的出现点（声明 +
+  真正解析到它的引用；局部遮蔽与同名无关声明身份不同，绝不进入批量替换），
+  生成绑定各文档版本号的方案；`/rename/apply` 落盘前重新核对每个相关文档的
+  版本与每个偏移处的原文，任一不符即整体拒绝（HTTP 409），应用是原子的——
+  所有文件一起前进，不存在部分已改的状态。`save:false` 仅修改会话文本
+  （保持未保存），`save:true` 同时标记为已落盘。
 - **结果绑定版本**：所有结果带 `snapshotId` 和每个文档的 `version`；每个位置带
   所属文档版本。
 - **增量更新**：编辑只重新词法/语法分析该文件；其它文件复用缓存的语法树，仅当
@@ -68,6 +76,10 @@ fn main() {
 - `POST /save` `{uri}` 标记当前版本已保存
 - `POST /definition` `{uri,offset}` 返回符号身份与声明位置
 - `POST /references` `{uri,offset}` 返回声明 + 全部引用位置
+ `POST /rename/prepare` `{uri,offset,newName}` 返回重命名预览方案（planId、
+  每条编辑的 uri/version/range/原文），不做任何修改
+ `POST /rename/apply` `{planId,save}` 校验并原子应用方案；方案过期返回 409，
+  需重新 prepare
 - `GET /status` 返回快照 ID、各文档版本/保存状态
 - `GET /health`
 
@@ -97,4 +109,7 @@ go run ./cmd/sourcenav -addr :8080
 
 `internal/workspace/workspace_test.go` 覆盖：相互引用文件、嵌套遮蔽、
 未保存改动、无关编辑下身份稳定、真实源码区间切片、未定义名诊断；
+ `internal/workspace/rename_test.go` 覆盖：遮蔽/同名排除、循环引用重命名、
+ 声明前插入文本后旧方案被拒且原子、并发双方案与无关编辑、未保存 overlay
+ 参与分析、save 标志语义、非法/冲突新名；
 `internal/server/server_test.go` 覆盖 HTTP 端到端链路。

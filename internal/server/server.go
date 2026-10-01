@@ -3,6 +3,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"sourcenav/internal/snapshot"
@@ -27,6 +28,8 @@ func (s *Server) Mux() http.Handler {
 	mux.HandleFunc("POST /save", s.save)
 	mux.HandleFunc("POST /definition", s.definition)
 	mux.HandleFunc("POST /references", s.references)
+	mux.HandleFunc("POST /rename/prepare", s.renamePrepare)
+	mux.HandleFunc("POST /rename/apply", s.renameApply)
 	return mux
 }
 
@@ -115,6 +118,48 @@ func (s *Server) references(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.ws.References(snapshot.URI(req.URI), req.Offset)
 	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+type renamePrepareReq struct {
+	URI     string `json:"uri"`
+	Offset  int    `json:"offset"`
+	NewName string `json:"newName"`
+}
+
+func (s *Server) renamePrepare(w http.ResponseWriter, r *http.Request) {
+	var req renamePrepareReq
+	if !decode(w, r, &req) {
+		return
+	}
+	plan, err := s.ws.PrepareRename(snapshot.URI(req.URI), req.Offset, req.NewName)
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, plan)
+}
+
+type renameApplyReq struct {
+	PlanID int64 `json:"planId"`
+	Save   bool  `json:"save"`
+}
+
+func (s *Server) renameApply(w http.ResponseWriter, r *http.Request) {
+	var req renameApplyReq
+	if !decode(w, r, &req) {
+		return
+	}
+	res, err := s.ws.ApplyRename(req.PlanID, req.Save)
+	if err != nil {
+		var stale *workspace.StalePlanError
+		if errors.As(err, &stale) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
 		writeError(w, http.StatusUnprocessableEntity, err)
 		return
 	}
