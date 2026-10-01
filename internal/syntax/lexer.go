@@ -35,6 +35,23 @@ var keywords = map[string]bool{
 	"let": true, "fn": true, "return": true, "if": true, "else": true,
 }
 
+// IsIdent reports whether s is a legal Edulang identifier (and not a
+// keyword), using the same character rules as the lexer.
+func IsIdent(s string) bool {
+	if s == "" || keywords[s] {
+		return false
+	}
+	for i, r := range s {
+		if i == 0 && unicode.IsDigit(r) {
+			return false
+		}
+		if !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_') {
+			return false
+		}
+	}
+	return true
+}
+
 func lex(src string) ([]token, error) {
 	l := &lexer{src: []byte(src), line: 1, col: 1}
 	for l.pos < len(l.src) {

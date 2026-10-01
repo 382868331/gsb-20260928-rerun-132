@@ -59,3 +59,80 @@ func TestHTTPEndToEnd(t *testing.T) {
 		t.Fatalf("snapshot id not bound: %v", version)
 	}
 }
+func TestHTTPRenamePreviewApplyAndStale(t *testing.T) {
+	h := server.New(workspace.New()).Mux()
+
+	srcA := "fn main() { return helper(1) }\n"
+	srcB := "fn helper(n) { return n + 1 }\n"
+	for _, d := range []map[string]any{
+		{"uri": "file:///m.edu", "text": srcA, "version": 1, "saved": true},
+		{"uri": "file:///h.edu", "text": srcB, "version": 1, "saved": true},
+	} {
+		if code, _ := post(t, h, "/open", d); code != http.StatusOK {
+			t.Fatalf("open status %d", code)
+		}
+	}
+
+	// Preview: rename helper -> util across both files.
+	code, plan := post(t, h, "/rename/prepare", map[string]any{
+		"uri": "file:///m.edu", "offset": strings.Index(srcA, "helper"), "newName": "util",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("prepare status %d: %v", code, plan)
+	}
+	files, _ := plan["files"].([]any)
+	if len(files) != 2 {
+		t.Fatalf("plan should touch 2 files: %v", plan)
+	}
+
+	// A related document changes after the preview: the old plan must be
+	// rejected with 409, not applied at stale offsets.
+	if code, _ := post(t, h, "/edit", map[string]any{
+		"uri": "file:///h.edu", "text": "// touched\n" + srcB, "version": 2,
+	}); code != http.StatusOK {
+		t.Fatalf("edit status %d", code)
+	}
+	if code, _ := post(t, h, "/rename/apply", plan); code != http.StatusConflict {
+		t.Fatalf("stale apply status = %d, want 409", code)
+	}
+
+	// Re-preview against the current snapshot, then apply.
+	code, plan2 := post(t, h, "/rename/prepare", map[string]any{
+		"uri": "file:///m.edu", "offset": strings.Index(srcA, "helper"), "newName": "util",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("re-prepare status %d", code)
+	}
+	code, applied := post(t, h, "/rename/apply", plan2)
+	if code != http.StatusOK {
+		t.Fatalf("apply status %d: %v", code, applied)
+	}
+	for _, d := range applied["documents"].([]any) {
+		doc := d.(map[string]any)
+		if doc["saved"].(bool) {
+			t.Fatalf("renamed doc %v must be unsaved (session text only)", doc["uri"])
+		}
+	}
+
+	// Definition and diagnostics re-checked after the rename.
+	code, def := post(t, h, "/definition", map[string]any{
+		"uri": "file:///m.edu", "offset": strings.Index(srcA, "helper"),
+	})
+	if code != http.StatusOK || def["symbolName"] != "util" {
+		t.Fatalf("definition after rename: %d %v", code, def)
+	}
+	loc := def["location"].(map[string]any)
+	if loc["uri"] != "file:///h.edu" || loc["range"].(map[string]any)["text"] != "util" {
+		t.Fatalf("util declaration wrong: %v", loc)
+	}
+	for _, u := range []string{"file:///m.edu", "file:///h.edu"} {
+		code, diags := post(t, h, "/diagnostics", map[string]any{"uri": u})
+		if code != http.StatusOK {
+			t.Fatalf("diagnostics status %d", code)
+		}
+		list, _ := diags["diagnostics"].([]any)
+		if len(list) != 0 {
+			t.Fatalf("diagnostics in %s after rename: %v", u, list)
+		}
+	}
+}
