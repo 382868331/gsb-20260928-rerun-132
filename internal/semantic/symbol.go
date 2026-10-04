@@ -34,6 +34,10 @@ type Symbol struct {
 	Kind Kind   `json:"kind"`
 	Name string `json:"name"`
 
+	// Module is the exporting module path, or "" for an anonymous-world
+	// declaration (a file without a module directive).
+	Module string `json:"module,omitempty"`
+
 	// LocalKey is empty for global symbols. For locals it encodes file +
 	// lexical nesting path + name, so two same-named locals in different
 	// scopes never share identity.
@@ -56,39 +60,48 @@ func NewRegistry() *Registry {
 	}
 }
 
-// Global returns the stable global symbol for name, creating it on first use.
-func (r *Registry) Global(name string, kind Kind) *Symbol {
+// GlobalKey is the registry key of a declaration exported by module mod.
+// An empty mod denotes the shared anonymous world (files without a module
+// directive); anonymous declarations are project-wide bare names exactly as
+// in the pre-module language.
+func GlobalKey(mod, name string) string {
+	return mod + "\x00" + name
+}
+
+// Global returns the stable symbol for a module-qualified declaration,
+// creating it on first use.
+func (r *Registry) Global(mod, name string, kind Kind) *Symbol {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if s, ok := r.globals[name]; ok {
+	key := GlobalKey(mod, name)
+	if s, ok := r.globals[key]; ok {
 		if s.Kind == KindUnknown {
 			s.Kind = kind
 		}
 		return s
 	}
 	r.nextID++
-	s := &Symbol{ID: r.nextID, Kind: kind, Name: name}
-	r.globals[name] = s
+	s := &Symbol{ID: r.nextID, Kind: kind, Name: name, Module: mod}
+	r.globals[key] = s
 	return s
 }
 
-// GlobalExisting returns the global symbol if it has ever been registered.
-func (r *Registry) GlobalExisting(name string) (*Symbol, bool) {
+// GlobalExisting returns the module-qualified symbol if registered.
+func (r *Registry) GlobalExisting(mod, name string) (*Symbol, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	s, ok := r.globals[name]
+	s, ok := r.globals[GlobalKey(mod, name)]
 	return s, ok
 }
 
-// PruneGlobals drops global identities whose names are not in live, so names
-// removed from the current snapshot stop resolving in other files. A name
-// reintroduced later is allocated a fresh identity.
+// PruneGlobals drops module-qualified identities whose keys are not in live,
+// so declarations removed from the snapshot stop resolving elsewhere.
 func (r *Registry) PruneGlobals(live map[string]bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for name := range r.globals {
-		if !live[name] {
-			delete(r.globals, name)
+	for key := range r.globals {
+		if !live[key] {
+			delete(r.globals, key)
 		}
 	}
 }

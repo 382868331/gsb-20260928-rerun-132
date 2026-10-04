@@ -1,10 +1,14 @@
 package syntax
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 type parser struct {
 	tokens []token
 	pos    int
+	depth  int
 }
 
 // Parse lexes and parses one Edulang document. The returned tree is purely a
@@ -81,6 +85,21 @@ func (p *parser) parseStmt() (Stmt, error) {
 		return p.parseLet()
 	case t.kind == tokKeyword && t.value == "fn":
 		return p.parseFn()
+	case t.kind == tokKeyword && t.value == "module":
+		if p.depth > 0 {
+			return nil, fmt.Errorf("syntax error at line %d col %d: module directive is only allowed at file top level", t.r.StartLine, t.r.StartColumn)
+		}
+		return p.parseModule()
+	case t.kind == tokKeyword && t.value == "import":
+		if p.depth > 0 {
+			return nil, fmt.Errorf("syntax error at line %d col %d: import directive is only allowed at file top level", t.r.StartLine, t.r.StartColumn)
+		}
+		return p.parseImport()
+	case t.kind == tokKeyword && t.value == "export":
+		if p.depth > 0 {
+			return nil, fmt.Errorf("syntax error at line %d col %d: export directive is only allowed at file top level", t.r.StartLine, t.r.StartColumn)
+		}
+		return p.parseExport()
 	case t.kind == tokKeyword && t.value == "return":
 		return p.parseReturn()
 	case t.kind == tokKeyword && t.value == "if":
@@ -88,6 +107,96 @@ func (p *parser) parseStmt() (Stmt, error) {
 	default:
 		return p.parseSimpleStmt()
 	}
+}
+
+// unquote turns a quoted source literal into its path contents, validating
+// that it looks like a module path (dot-separated identifiers).
+func unquote(raw string) (string, error) {
+	if len(raw) < 2 || raw[0] != '"' || raw[len(raw)-1] != '"' {
+		return "", fmt.Errorf("malformed string literal %q", raw)
+	}
+	path := raw[1 : len(raw)-1]
+	if path == "" {
+		return "", fmt.Errorf("empty module path")
+	}
+	for _, part := range strings.Split(path, ".") {
+		if !IsIdent(part) {
+			return "", fmt.Errorf("invalid module path %q: %q is not an identifier", path, part)
+		}
+	}
+	return path, nil
+}
+
+func pathBase(path string) string {
+	if i := strings.LastIndex(path, "."); i >= 0 {
+		return path[i+1:]
+	}
+	return path
+}
+
+func (p *parser) parseModule() (*ModuleStmt, error) {
+	start := p.next() // 'module'
+	lit, err := p.want(tokString, "")
+	if err != nil {
+		return nil, err
+	}
+	path, err := unquote(lit.value)
+	if err != nil {
+		return nil, fmt.Errorf("syntax error at line %d col %d: %v", lit.r.StartLine, lit.r.StartColumn, err)
+	}
+	p.skipSemi()
+	return &ModuleStmt{Range: span(start.r, lit.r), Path: path, PathRange: lit.r}, nil
+}
+
+func (p *parser) parseImport() (*ImportStmt, error) {
+	start := p.next() // 'import'
+	lit, err := p.want(tokString, "")
+	if err != nil {
+		return nil, err
+	}
+	path, err := unquote(lit.value)
+	if err != nil {
+		return nil, fmt.Errorf("syntax error at line %d col %d: %v", lit.r.StartLine, lit.r.StartColumn, err)
+	}
+	s := &ImportStmt{Range: span(start.r, lit.r), Path: path, PathRange: lit.r}
+	if p.peek().kind == tokKeyword && p.peek().value == "as" {
+		// 'as' is a contextual keyword here so it stays usable as an identifier.
+	} else if p.peek().kind == tokIdent && p.peek().value == "as" {
+		p.next()
+		alias, err := p.want(tokIdent, "")
+		if err != nil {
+			return nil, err
+		}
+		if !IsIdent(alias.value) {
+			return nil, fmt.Errorf("syntax error at line %d col %d: bad import alias %q", alias.r.StartLine, alias.r.StartColumn, alias.value)
+		}
+		s.HasAlias = true
+		s.Alias, s.AliasRange = alias.value, alias.r
+		s.Range = span(start.r, alias.r)
+	}
+	p.skipSemi()
+	return s, nil
+}
+
+func (p *parser) parseExport() (*ExportStmt, error) {
+	start := p.next() // 'export'
+	local, err := p.want(tokIdent, "")
+	if err != nil {
+		return nil, err
+	}
+	s := &ExportStmt{Range: span(start.r, local.r), Local: local.value, LocalRange: local.r}
+	if p.peek().kind == tokIdent && p.peek().value == "as" {
+		p.next()
+		ext, err := p.want(tokIdent, "")
+		if err != nil {
+			return nil, err
+		}
+		s.HasExternal = true
+		s.External, s.ExtRange = ext.value, ext.r
+		s.Range = span(start.r, ext.r)
+	}
+	p.skipSemi()
+	return s, nil
 }
 
 func (p *parser) parseLet() (*LetStmt, error) {
@@ -199,6 +308,8 @@ func (p *parser) parseBlock() (*BlockStmt, error) {
 		return nil, err
 	}
 	b := &BlockStmt{}
+	p.depth++
+	defer func() { p.depth-- }()
 	p.skipSemi()
 	for !(p.peek().kind == tokPunct && p.peek().value == "}") && !p.atEOF() {
 		s, err := p.parseStmt()
@@ -288,11 +399,29 @@ func (p *parser) parsePrimary() (Expr, error) {
 		return &BasicLit{Range: t.r, Value: t.value}, nil
 	case tokIdent:
 		p.next()
-		id := &Ident{Range: t.r, Name: t.value}
-		if p.peek().kind == tokPunct && p.peek().value == "(" {
-			return p.parseCall(id)
+		var qual string
+		var qualRange Range
+		expr := Expr(&Ident{Range: t.r, Name: t.value})
+		qual, qualRange = t.value, t.r
+		for p.peek().kind == tokPunct && p.peek().value == "." {
+			p.next() // dot
+			sel, err := p.want(tokIdent, "")
+			if err != nil {
+				return nil, err
+			}
+			expr = &SelectorExpr{
+				Range:     span(t.r, sel.r),
+				Qual:      qual,
+				QualRange: qualRange,
+				Sel:       sel.value,
+				SelRange:  sel.r,
+			}
+			qual, qualRange = sel.value, sel.r
 		}
-		return id, nil
+		if p.peek().kind == tokPunct && p.peek().value == "(" {
+			return p.parseCall(expr)
+		}
+		return expr, nil
 	case tokPunct:
 		if t.value == "(" {
 			p.next()
@@ -309,7 +438,7 @@ func (p *parser) parsePrimary() (Expr, error) {
 	return nil, fmt.Errorf("syntax error at line %d col %d: unexpected token %q", t.r.StartLine, t.r.StartColumn, t.value)
 }
 
-func (p *parser) parseCall(fun *Ident) (*CallExpr, error) {
+func (p *parser) parseCall(fun Expr) (*CallExpr, error) {
 	p.next() // '('
 	c := &CallExpr{Fun: fun}
 	for !(p.peek().kind == tokPunct && p.peek().value == ")") {

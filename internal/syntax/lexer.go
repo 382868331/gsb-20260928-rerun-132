@@ -12,6 +12,7 @@ const (
 	tokEOF tokenKind = iota
 	tokIdent
 	tokInt
+	tokString
 	tokKeyword
 	tokOp
 	tokPunct
@@ -33,6 +34,7 @@ type lexer struct {
 
 var keywords = map[string]bool{
 	"let": true, "fn": true, "return": true, "if": true, "else": true,
+	"module": true, "import": true, "export": true,
 }
 
 // IsIdent reports whether s is a legal Edulang identifier (and not a
@@ -62,6 +64,10 @@ func lex(src string) ([]token, error) {
 		switch {
 		case r == ' ' || r == '\t' || r == '\r' || r == '\n':
 			l.advance(r, size)
+		case r == '"':
+			if err := l.lexString(); err != nil {
+				return nil, err
+			}
 		case r == '/' && l.pos+1 < len(l.src) && l.src[l.pos+1] == '/':
 			for l.pos < len(l.src) && l.src[l.pos] != '\n' {
 				l.advanceRaw(1)
@@ -148,6 +154,31 @@ func (l *lexer) lexNumber() {
 	l.emit(tokInt, string(l.src[start:l.pos]), start, sLine, sCol)
 }
 
+// lexString consumes a double-quoted module path. Only simple escapes are
+// supported; the recorded value is the raw quoted text including quotes, so
+// later stages know the exact source bytes the literal covered.
+func (l *lexer) lexString() error {
+	start, sLine, sCol := l.start()
+	l.advanceRaw(1) // opening quote
+	for l.pos < len(l.src) {
+		r, size := utf8.DecodeRune(l.src[l.pos:])
+		if r == '\n' {
+			return fmt.Errorf("syntax error at line %d col %d: unterminated string", l.line, l.col)
+		}
+		if r == '\\' && l.pos+1 < len(l.src) {
+			l.advanceRaw(2)
+			continue
+		}
+		if r == '"' {
+			l.advanceRaw(1)
+			l.emit(tokString, string(l.src[start:l.pos]), start, sLine, sCol)
+			return nil
+		}
+		l.advance(r, size)
+	}
+	return fmt.Errorf("syntax error at line %d col %d: unterminated string", sLine, sCol)
+}
+
 func (l *lexer) lexPunct(r rune, size int) error {
 	start, sLine, sCol := l.start()
 	if (r == '=' || r == '!' || r == '>' || r == '<') && l.pos+1 < len(l.src) && l.src[l.pos+1] == '=' {
@@ -160,7 +191,7 @@ func (l *lexer) lexPunct(r rune, size int) error {
 	case '+', '-', '*', '=', '>', '<':
 		l.advance(r, size)
 		l.emit(tokOp, string(r), start, sLine, sCol)
-	case '(', ')', '{', '}', ',', ';':
+	case '(', ')', '{', '}', ',', ';', '.':
 		l.advance(r, size)
 		l.emit(tokPunct, string(r), start, sLine, sCol)
 	default:

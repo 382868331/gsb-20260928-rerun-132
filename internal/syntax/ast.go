@@ -101,10 +101,20 @@ type BasicLit struct {
 	Value string
 }
 
-// CallExpr: callee(args...), callee must resolve to an identifier.
+// SelectorExpr: mod.name — a qualified name whose qualifier must resolve to
+// an imported module (never a local variable).
+type SelectorExpr struct {
+	Range     Range
+	Qual      string
+	QualRange Range
+	Sel       string
+	SelRange  Range
+}
+
+// CallExpr: callee(args...); callee is a bare or qualified name.
 type CallExpr struct {
 	Range Range
-	Fun   *Ident
+	Fun   Expr
 	Args  []Expr
 }
 
@@ -124,6 +134,39 @@ type IfStmt struct {
 	Else  *BlockStmt
 }
 
+// ModuleStmt: module "path"
+// It declares the module this document belongs to. At most one may appear,
+// and only as the first non-comment directive.
+type ModuleStmt struct {
+	Range     Range
+	Path      string
+	PathRange Range
+}
+
+// ImportStmt: import "path" [as local]
+// Local is empty when the module is bound under its final path component.
+type ImportStmt struct {
+	Range      Range
+	Path       string
+	PathRange  Range
+	HasAlias   bool
+	Alias      string
+	AliasRange Range
+}
+
+// ExportStmt: export [as external] local
+// External is empty when the re-export keeps the local name. Re-exports keep
+// the same symbol identity: consumers bind to the original declaration, never
+// to a copy.
+type ExportStmt struct {
+	Range       Range
+	Local       string
+	LocalRange  Range
+	HasExternal bool
+	External    string
+	ExtRange    Range
+}
+
 func (s *LetStmt) stmtNode()           {}
 func (s *FnStmt) stmtNode()            {}
 func (s *BlockStmt) stmtNode()         {}
@@ -131,6 +174,9 @@ func (s *ReturnStmt) stmtNode()        {}
 func (s *AssignStmt) stmtNode()        {}
 func (s *ExprStmt) stmtNode()          {}
 func (s *IfStmt) stmtNode()            {}
+func (s *ModuleStmt) stmtNode()        {}
+func (s *ImportStmt) stmtNode()        {}
+func (s *ExportStmt) stmtNode()        {}
 func (s *LetStmt) nodeRange() Range    { return s.Range }
 func (s *FnStmt) nodeRange() Range     { return s.Range }
 func (s *BlockStmt) nodeRange() Range  { return s.Range }
@@ -138,12 +184,17 @@ func (s *ReturnStmt) nodeRange() Range { return s.Range }
 func (s *AssignStmt) nodeRange() Range { return s.Range }
 func (s *ExprStmt) nodeRange() Range   { return s.Range }
 func (s *IfStmt) nodeRange() Range     { return s.Range }
+func (s *ModuleStmt) nodeRange() Range { return s.Range }
+func (s *ImportStmt) nodeRange() Range { return s.Range }
+func (s *ExportStmt) nodeRange() Range { return s.Range }
 
-func (e *Ident) exprNode()             {}
-func (e *BasicLit) exprNode()          {}
-func (e *CallExpr) exprNode()          {}
-func (e *BinaryExpr) exprNode()        {}
+func (e *Ident) exprNode()        {}
+func (e *BasicLit) exprNode()     {}
+func (e *CallExpr) exprNode()     {}
+func (e *BinaryExpr) exprNode()   {}
+func (e *SelectorExpr) exprNode() {}
 func (e *Ident) nodeRange() Range      { return e.Range }
 func (e *BasicLit) nodeRange() Range   { return e.Range }
 func (e *CallExpr) nodeRange() Range   { return e.Range }
 func (e *BinaryExpr) nodeRange() Range { return e.Range }
+func (e *SelectorExpr) nodeRange() Range { return e.Range }
