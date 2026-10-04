@@ -31,6 +31,9 @@ func (s *Server) Mux() http.Handler {
 	mux.HandleFunc("POST /diagnostics", s.diagnostics)
 	mux.HandleFunc("POST /rename/prepare", s.renamePrepare)
 	mux.HandleFunc("POST /rename/apply", s.renameApply)
+	mux.HandleFunc("POST /move/prepare", s.movePrepare)
+	mux.HandleFunc("POST /move/apply", s.moveApply)
+	mux.HandleFunc("POST /move/undo", s.moveUndo)
 	return mux
 }
 
@@ -166,6 +169,62 @@ func (s *Server) references(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.ws.References(snapshot.URI(req.URI), req.Offset)
 	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+type movePrepareReq struct {
+	Target string                   `json:"target"`
+	Items  []workspace.MoveItemSpec `json:"items"`
+}
+
+func (s *Server) movePrepare(w http.ResponseWriter, r *http.Request) {
+	var req movePrepareReq
+	if !decode(w, r, &req) {
+		return
+	}
+	plan, err := s.ws.PrepareMove(snapshot.URI(req.Target), req.Items)
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, plan)
+}
+
+func (s *Server) moveApply(w http.ResponseWriter, r *http.Request) {
+	var plan workspace.MovePlan
+	if !decode(w, r, &plan) {
+		return
+	}
+	res, err := s.ws.ApplyMove(plan)
+	if err != nil {
+		if errors.Is(err, workspace.ErrStaleMovePlan) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
+		writeError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+type moveUndoReq struct {
+	Token int64 `json:"token"`
+}
+
+func (s *Server) moveUndo(w http.ResponseWriter, r *http.Request) {
+	var req moveUndoReq
+	if !decode(w, r, &req) {
+		return
+	}
+	res, err := s.ws.UndoMove(req.Token)
+	if err != nil {
+		if errors.Is(err, workspace.ErrStaleMovePlan) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
 		writeError(w, http.StatusUnprocessableEntity, err)
 		return
 	}

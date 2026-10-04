@@ -77,21 +77,24 @@ type fileState struct {
 
 // Workspace is a single navigation session, safe for concurrent use.
 type Workspace struct {
-	mu        sync.Mutex
-	snap      *snapshot.Snapshot
-	nextSnap  int64
-	reg       *semantic.Registry
-	files     map[snapshot.URI]*fileState
-	parseErrs map[snapshot.URI]error
+	mu           sync.Mutex
+	snap         *snapshot.Snapshot
+	nextSnap     int64
+	reg          *semantic.Registry
+	files        map[snapshot.URI]*fileState
+	parseErrs    map[snapshot.URI]error
+	moveUndo     *moveUndoState
+	nextMoveUndo int64
 }
 
 // New creates an empty workspace.
 func New() *Workspace {
 	return &Workspace{
-		nextSnap:  1,
-		reg:       semantic.NewRegistry(),
-		files:     make(map[snapshot.URI]*fileState),
-		parseErrs: make(map[snapshot.URI]error),
+		nextSnap:     1,
+		nextMoveUndo: 1,
+		reg:          semantic.NewRegistry(),
+		files:        make(map[snapshot.URI]*fileState),
+		parseErrs:    make(map[snapshot.URI]error),
 	}
 }
 
