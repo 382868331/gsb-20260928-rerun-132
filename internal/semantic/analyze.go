@@ -81,38 +81,108 @@ func (s *scope) lookup(name string) (*Symbol, bool) {
 	return nil, false
 }
 
-// globalScope resolves only project-global names. It roots every file's
-// resolution chain, which makes cross-file mutual references work while
-// guaranteeing file/function-local names can never leak between files.
-type globalScope struct{ reg *Registry }
+// projectScope resolves project-global names visible from one file: first
+// the file's own module, then the shared anonymous world (files without a
+// module directive). It roots every file's resolution chain, which makes
+// cross-file mutual references work while guaranteeing file/function-local
+// names can never leak between files.
+type projectScope struct {
+	reg    *Registry
+	module string
+}
 
-func (g globalScope) lookup(name string) (*Symbol, bool) { return g.reg.GlobalExisting(name) }
+func (g projectScope) lookup(name string) (*Symbol, bool) {
+	if s, ok := g.reg.GlobalExisting(g.module, name); ok {
+		return s, true
+	}
+	if g.module != "" {
+		return g.reg.GlobalExisting("", name)
+	}
+	return nil, false
+}
+
+// ExportTarget resolves the symbol an export directive refers to: first the
+// exporting module's own declarations, then a unique match across the
+// modules the file imports. matches is 0 when nothing provides the name and
+// greater than 1 when several imported modules do (ambiguous).
+func ExportTarget(reg *Registry, module string, imports map[string]string, local string) (*Symbol, int) {
+	if s, ok := reg.GlobalExisting(module, local); ok {
+		return s, 1
+	}
+	var found *Symbol
+	seen := map[*Symbol]bool{}
+	for _, mod := range imports {
+		if s, ok := reg.GlobalExisting(mod, local); ok && !seen[s] {
+			seen[s] = true
+			found = s
+		}
+	}
+	return found, len(seen)
+}
 
 type analyzer struct {
-	reg    *Registry
-	root   resolver
-	uri    snapshot.URI
-	file   *syntax.File
-	result *FileAnalysis
+	reg     *Registry
+	root    resolver
+	uri     snapshot.URI
+	file    *syntax.File
+	module  string
+	imports map[string]string
+	result  *FileAnalysis
 }
 
 // AnalyzeFile performs lexical resolution for one document. The registry is
 // pre-populated with every project-wide global name (collected from all
-// files first), which is what makes mutual references resolve in any order.
+// files first), which makes mutual references resolve in any order.
 func AnalyzeFile(reg *Registry, doc snapshot.Document, tree *syntax.File) (*FileAnalysis, error) {
 	a := &analyzer{
-		reg:    reg,
-		root:   globalScope{reg: reg},
-		uri:    doc.URI,
-		file:   tree,
-		result: &FileAnalysis{URI: doc.URI, Version: doc.Version, File: tree},
+		reg:     reg,
+		uri:     doc.URI,
+		file:    tree,
+		module:  syntax.ModulePath(tree),
+		imports: syntax.Imports(tree),
+		result:  &FileAnalysis{URI: doc.URI, Version: doc.Version, File: tree},
 	}
+	a.root = projectScope{reg: reg, module: a.module}
+	a.checkDirectives()
 	fileScope := &scope{parent: a.root, path: "", decls: make(map[string]*Symbol)}
 	a.hoistTopLevels(fileScope)
 	for _, st := range tree.Stmts {
 		a.resolveStmt(fileScope, st)
 	}
 	return a.result, nil
+}
+
+// checkDirectives reports malformed module/import structure: more than one
+// module directive, or two imports competing for the same alias.
+func (a *analyzer) checkDirectives() {
+	seenModule := false
+	seenAlias := map[string]bool{}
+	for _, st := range a.file.Stmts {
+		switch n := st.(type) {
+		case *syntax.ModuleStmt:
+			if seenModule {
+				a.result.Diagnostics = append(a.result.Diagnostics, Diagnostic{
+					URI: a.uri, Range: n.PathRange, Message: "duplicate module directive",
+				})
+			}
+			seenModule = true
+		case *syntax.ImportStmt:
+			alias := n.Alias
+			if !n.HasAlias {
+				for k, v := range a.imports {
+					if v == n.Path {
+						alias = k
+					}
+				}
+			}
+			if seenAlias[alias] {
+				a.result.Diagnostics = append(a.result.Diagnostics, Diagnostic{
+					URI: a.uri, Range: n.Range, Message: fmt.Sprintf("duplicate import alias %q", alias),
+				})
+			}
+			seenAlias[alias] = true
+		}
+	}
 }
 
 func (a *analyzer) hoistTopLevels(fileScope *scope) {
@@ -136,7 +206,7 @@ func (a *analyzer) hoistTopLevels(fileScope *scope) {
 			})
 			continue
 		}
-		sym := a.reg.Global(name, kind)
+		sym := a.reg.Global(a.module, name, kind)
 		fileScope.decls[name] = sym
 		occ := Occurrence{URI: a.uri, Range: r, Symbol: sym, Role: RoleDecl, Kind: kind}
 		a.result.Occurrences = append(a.result.Occurrences, occ)
@@ -169,6 +239,10 @@ func (a *analyzer) declareLocal(s *scope, name string, kind Kind, r syntax.Range
 
 func (a *analyzer) resolveStmt(s *scope, st syntax.Stmt) {
 	switch n := st.(type) {
+	case *syntax.ModuleStmt, *syntax.ImportStmt:
+		// Directives were handled when the analyzer was built.
+	case *syntax.ExportStmt:
+		a.resolveExport(n)
 	case *syntax.LetStmt:
 		if s.path == "" {
 			// File-level declaration was hoisted; resolve initializer only.
@@ -205,6 +279,44 @@ func (a *analyzer) resolveStmt(s *scope, st syntax.Stmt) {
 				a.resolveStmt(els, inner)
 			}
 		}
+	}
+}
+
+// resolveExport binds a re-export. The exported name keeps the target's
+// identity: consumers of a compatible entry bind to the original
+// declaration, never to a copy.
+func (a *analyzer) resolveExport(n *syntax.ExportStmt) {
+	target, matches := ExportTarget(a.reg, a.module, a.imports, n.Local)
+	switch {
+	case matches == 0:
+		a.result.Diagnostics = append(a.result.Diagnostics, Diagnostic{
+			URI: a.uri, Range: n.LocalRange,
+			Message: fmt.Sprintf("exported name %q is not declared in this module nor provided by any import", n.Local),
+		})
+		target = a.reg.Global(a.module, n.Local, KindUnknown)
+	case matches > 1:
+		a.result.Diagnostics = append(a.result.Diagnostics, Diagnostic{
+			URI: a.uri, Range: n.LocalRange,
+			Message: fmt.Sprintf("exported name %q is provided by more than one imported module", n.Local),
+		})
+	}
+	a.result.Occurrences = append(a.result.Occurrences, Occurrence{
+		URI: a.uri, Range: n.LocalRange, Symbol: target, Role: RoleUse, Kind: target.Kind,
+	})
+	external := n.Local
+	if n.HasExternal {
+		external = n.External
+	}
+	if !a.reg.Alias(a.module, external, target) {
+		a.result.Diagnostics = append(a.result.Diagnostics, Diagnostic{
+			URI: a.uri, Range: n.Range,
+			Message: fmt.Sprintf("exported name %q conflicts with an existing declaration in this module", external),
+		})
+	}
+	if n.HasExternal {
+		a.result.Occurrences = append(a.result.Occurrences, Occurrence{
+			URI: a.uri, Range: n.ExtRange, Symbol: target, Role: RoleDecl, Kind: target.Kind,
+		})
 	}
 }
 
@@ -246,7 +358,7 @@ func (a *analyzer) use(s resolver, name string, r syntax.Range) {
 		a.result.Diagnostics = append(a.result.Diagnostics, Diagnostic{
 			URI: a.uri, Range: r, Message: fmt.Sprintf("undeclared name %q", name),
 		})
-		sym = a.reg.Global(name, KindUnknown)
+		sym = a.reg.Global(a.module, name, KindUnknown)
 	}
 	a.result.Occurrences = append(a.result.Occurrences, Occurrence{
 		URI: a.uri, Range: r, Symbol: sym, Role: RoleUse, Kind: sym.Kind,
@@ -262,10 +374,36 @@ func (a *analyzer) resolveExpr(s resolver, e syntax.Expr) {
 	case *syntax.BinaryExpr:
 		a.resolveExpr(s, n.X)
 		a.resolveExpr(s, n.Y)
+	case *syntax.SelectorExpr:
+		a.resolveSelector(n)
 	case *syntax.CallExpr:
-		a.use(s, n.Fun.Name, n.Fun.Range)
+		a.resolveExpr(s, n.Fun)
 		for _, arg := range n.Args {
 			a.resolveExpr(s, arg)
 		}
 	}
+}
+
+// resolveSelector resolves mod.name: the qualifier must be an imported
+// module alias, and the selected name must be exported by that module.
+func (a *analyzer) resolveSelector(n *syntax.SelectorExpr) {
+	mod, ok := a.imports[n.Qual]
+	if !ok {
+		a.result.Diagnostics = append(a.result.Diagnostics, Diagnostic{
+			URI: a.uri, Range: n.QualRange,
+			Message: fmt.Sprintf("unknown module qualifier %q (no matching import)", n.Qual),
+		})
+		return
+	}
+	sym, ok := a.reg.GlobalExisting(mod, n.Sel)
+	if !ok {
+		a.result.Diagnostics = append(a.result.Diagnostics, Diagnostic{
+			URI: a.uri, Range: n.SelRange,
+			Message: fmt.Sprintf("module %q has no exported name %q", mod, n.Sel),
+		})
+		sym = a.reg.Global(mod, n.Sel, KindUnknown)
+	}
+	a.result.Occurrences = append(a.result.Occurrences, Occurrence{
+		URI: a.uri, Range: n.SelRange, Symbol: sym, Role: RoleUse, Kind: sym.Kind,
+	})
 }

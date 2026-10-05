@@ -136,3 +136,71 @@ func TestHTTPRenamePreviewApplyAndStale(t *testing.T) {
 		}
 	}
 }
+
+// HTTP flow for declaration migration: prepare, apply, verify kept
+// references resolve, then undo and verify the original definition is back.
+func TestHTTPMoveFlow(t *testing.T) {
+	h := server.New(workspace.New()).Mux()
+
+	srcA := "module \"app.a\"\n\nfn helper(x) { return x + 1 }\n"
+	srcB := "module \"app.b\"\n\nimport \"app.a\"\n\nfn run(y) { return a.helper(y) }\n"
+	for _, d := range []map[string]any{
+		{"uri": "file:///a.edu", "text": srcA, "version": 1, "saved": true},
+		{"uri": "file:///b.edu", "text": srcB, "version": 1, "saved": true},
+	} {
+		if code, _ := post(t, h, "/open", d); code != http.StatusOK {
+			t.Fatalf("open status %d", code)
+		}
+	}
+
+	selOff := strings.Index(srcB, "helper")
+	code, def := post(t, h, "/definition", map[string]any{"uri": "file:///b.edu", "offset": selOff})
+	if code != http.StatusOK {
+		t.Fatalf("definition status %d", code)
+	}
+	origID := def["symbolId"]
+
+	code, plan := post(t, h, "/move/prepare", map[string]any{
+		"uri": "file:///a.edu", "offset": strings.Index(srcA, "helper"),
+		"destUri": "file:///b.edu", "newName": "util", "keepCompat": true,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("move/prepare status %d: %v", code, plan)
+	}
+	code, applied := post(t, h, "/move/apply", plan)
+	if code != http.StatusOK {
+		t.Fatalf("move/apply status %d: %v", code, applied)
+	}
+
+	// Kept reference still resolves, to the compat entry in a.edu, with the
+	// same identity.
+	code, def = post(t, h, "/definition", map[string]any{"uri": "file:///b.edu", "offset": selOff})
+	if code != http.StatusOK {
+		t.Fatalf("definition after move status %d", code)
+	}
+	if def["symbolId"] != origID {
+		t.Fatalf("identity changed across move: %v -> %v", origID, def["symbolId"])
+	}
+	loc, _ := def["location"].(map[string]any)
+	if loc == nil || loc["uri"] != "file:///a.edu" {
+		t.Fatalf("kept reference should resolve to compat entry in a.edu: %v", def)
+	}
+
+	// Undo restores the original declaration site.
+	code, _ = post(t, h, "/move/undo", map[string]any{})
+	if code != http.StatusOK {
+		t.Fatalf("move/undo status %d", code)
+	}
+	code, def = post(t, h, "/definition", map[string]any{"uri": "file:///b.edu", "offset": selOff})
+	if code != http.StatusOK {
+		t.Fatalf("definition after undo status %d", code)
+	}
+	if def["symbolId"] != origID {
+		t.Fatalf("identity not restored: %v -> %v", origID, def["symbolId"])
+	}
+	loc, _ = def["location"].(map[string]any)
+	rng, _ := loc["range"].(map[string]any)
+	if loc == nil || loc["uri"] != "file:///a.edu" || rng["text"] != "helper" || rng["startLine"] != 3.0 {
+		t.Fatalf("original declaration not restored: %v", def)
+	}
+}

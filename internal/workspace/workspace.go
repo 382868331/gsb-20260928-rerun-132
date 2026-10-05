@@ -83,6 +83,7 @@ type Workspace struct {
 	reg       *semantic.Registry
 	files     map[snapshot.URI]*fileState
 	parseErrs map[snapshot.URI]error
+	moveUndo  []moveUndo
 }
 
 // New creates an empty workspace.
@@ -178,9 +179,10 @@ func (w *Workspace) rebuild(changed snapshot.URI) {
 	}
 
 	// Pass 1 (syntax only): register every project-global name and kind from
-	// every parseable file. This makes mutual references resolvable regardless
-	// of declaration order and across files.
+	// every parseable file, qualified by the file's module. This makes mutual
+	// references resolvable regardless of declaration order and across files.
 	live := map[string]bool{}
+	trees := map[snapshot.URI]*syntax.File{}
 	for _, u := range w.snapshot().URIs() {
 		st := w.files[u]
 		var t *syntax.File
@@ -195,14 +197,43 @@ func (w *Workspace) rebuild(changed snapshot.URI) {
 		if t == nil {
 			continue
 		}
+		trees[u] = t
+		mod := syntax.ModulePath(t)
 		for _, s := range t.Stmts {
 			switch n := s.(type) {
 			case *syntax.FnStmt:
-				w.reg.Global(n.Name, semantic.KindFunc)
-				live[n.Name] = true
+				w.reg.Global(mod, n.Name, semantic.KindFunc)
+				live[semantic.GlobalKey(mod, n.Name)] = true
 			case *syntax.LetStmt:
-				w.reg.Global(n.Name, semantic.KindVar)
-				live[n.Name] = true
+				w.reg.Global(mod, n.Name, semantic.KindVar)
+				live[semantic.GlobalKey(mod, n.Name)] = true
+			}
+		}
+	}
+
+	// Pass 1.5 (syntax only): register re-export aliases. A compat entry such
+	// as 'export util as helper' binds the alias to the original symbol, so
+	// kept references resolve through it to the same identity. Two rounds let
+	// chained re-exports (alias of an alias) settle.
+	for round := 0; round < 2; round++ {
+		for _, t := range trees {
+			mod := syntax.ModulePath(t)
+			imports := syntax.Imports(t)
+			for _, s := range t.Stmts {
+				exp, ok := s.(*syntax.ExportStmt)
+				if !ok {
+					continue
+				}
+				target, matches := semantic.ExportTarget(w.reg, mod, imports, exp.Local)
+				if matches != 1 {
+					continue
+				}
+				external := exp.Local
+				if exp.HasExternal {
+					external = exp.External
+				}
+				w.reg.Alias(mod, external, target)
+				live[semantic.GlobalKey(mod, external)] = true
 			}
 		}
 	}
@@ -234,17 +265,95 @@ func (w *Workspace) rebuild(changed snapshot.URI) {
 	}
 }
 
+// rebuildAllLocked re-registers every global and re-analyses every file in
+// one pass. Structural operations (declaration moves and their undo) use it
+// so no stale syntax tree can mint transient identities or leave exports
+// bound to the wrong symbol. Untouched documents reuse their cached trees.
+func (w *Workspace) rebuildAllLocked() {
+	trees := map[snapshot.URI]*syntax.File{}
+	for _, u := range w.snapshot().URIs() {
+		doc, _ := w.snapshot().Get(u)
+		if st := w.files[u]; st != nil && st.tree != nil && st.doc.Version == doc.Version && st.doc.Text == doc.Text {
+			trees[u] = st.tree
+			continue
+		}
+		tree, err := syntax.Parse(doc.Text)
+		if err != nil {
+			delete(w.files, u)
+			w.parseErrs[u] = err
+			continue
+		}
+		delete(w.parseErrs, u)
+		trees[u] = tree
+	}
+
+	live := map[string]bool{}
+	for _, t := range trees {
+		mod := syntax.ModulePath(t)
+		for _, s := range t.Stmts {
+			switch n := s.(type) {
+			case *syntax.FnStmt:
+				w.reg.Global(mod, n.Name, semantic.KindFunc)
+				live[semantic.GlobalKey(mod, n.Name)] = true
+			case *syntax.LetStmt:
+				w.reg.Global(mod, n.Name, semantic.KindVar)
+				live[semantic.GlobalKey(mod, n.Name)] = true
+			}
+		}
+	}
+	for round := 0; round < 2; round++ {
+		for _, t := range trees {
+			mod := syntax.ModulePath(t)
+			imports := syntax.Imports(t)
+			for _, s := range t.Stmts {
+				exp, ok := s.(*syntax.ExportStmt)
+				if !ok {
+					continue
+				}
+				target, matches := semantic.ExportTarget(w.reg, mod, imports, exp.Local)
+				if matches != 1 {
+					continue
+				}
+				external := exp.Local
+				if exp.HasExternal {
+					external = exp.External
+				}
+				w.reg.Alias(mod, external, target)
+				live[semantic.GlobalKey(mod, external)] = true
+			}
+		}
+	}
+	w.reg.PruneGlobals(live)
+
+	for u, tree := range trees {
+		doc, _ := w.snapshot().Get(u)
+		a, aerr := semantic.AnalyzeFile(w.reg, doc, tree)
+		if aerr != nil {
+			w.parseErrs[u] = aerr
+			continue
+		}
+		w.files[u] = &fileState{doc: doc, tree: tree, analysis: a}
+	}
+}
+
 func globalNames(t *syntax.File) []string {
 	if t == nil {
 		return nil
 	}
+	mod := syntax.ModulePath(t)
 	var names []string
 	for _, s := range t.Stmts {
 		switch n := s.(type) {
 		case *syntax.FnStmt:
-			names = append(names, n.Name)
+			names = append(names, semantic.GlobalKey(mod, n.Name))
 		case *syntax.LetStmt:
-			names = append(names, n.Name)
+			names = append(names, semantic.GlobalKey(mod, n.Name))
+		case *syntax.ExportStmt:
+			if n.HasExternal {
+				names = append(names, semantic.GlobalKey(mod, n.External))
+			} else {
+				names = append(names, semantic.GlobalKey(mod, n.Local))
+			}
 		}
 	}
 	return names
@@ -252,7 +361,7 @@ func globalNames(t *syntax.File) []string {
 
 func mentionsAny(a *semantic.FileAnalysis, names map[string]bool) bool {
 	for _, o := range a.Occurrences {
-		if names[o.Symbol.Name] {
+		if names[semantic.GlobalKey(o.Symbol.Module, o.Symbol.Name)] {
 			return true
 		}
 	}
@@ -388,6 +497,10 @@ func (w *Workspace) References(uri snapshot.URI, offset int) (ReferencesResult, 
 func (w *Workspace) Status() StatusResult {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	return w.statusLocked()
+}
+
+func (w *Workspace) statusLocked() StatusResult {
 	res := StatusResult{Version: w.versionInfoLocked()}
 	for _, u := range w.snapshot().URIs() {
 		doc, _ := w.snapshot().Get(u)

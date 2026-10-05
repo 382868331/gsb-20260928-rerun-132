@@ -188,13 +188,13 @@ func (s *ModuleStmt) nodeRange() Range { return s.Range }
 func (s *ImportStmt) nodeRange() Range { return s.Range }
 func (s *ExportStmt) nodeRange() Range { return s.Range }
 
-func (e *Ident) exprNode()        {}
-func (e *BasicLit) exprNode()     {}
-func (e *CallExpr) exprNode()     {}
-func (e *BinaryExpr) exprNode()   {}
-func (e *SelectorExpr) exprNode() {}
-func (e *Ident) nodeRange() Range      { return e.Range }
-func (e *BasicLit) nodeRange() Range   { return e.Range }
-func (e *CallExpr) nodeRange() Range   { return e.Range }
-func (e *BinaryExpr) nodeRange() Range { return e.Range }
+func (e *Ident) exprNode()               {}
+func (e *BasicLit) exprNode()            {}
+func (e *CallExpr) exprNode()            {}
+func (e *BinaryExpr) exprNode()          {}
+func (e *SelectorExpr) exprNode()        {}
+func (e *Ident) nodeRange() Range        { return e.Range }
+func (e *BasicLit) nodeRange() Range     { return e.Range }
+func (e *CallExpr) nodeRange() Range     { return e.Range }
+func (e *BinaryExpr) nodeRange() Range   { return e.Range }
 func (e *SelectorExpr) nodeRange() Range { return e.Range }

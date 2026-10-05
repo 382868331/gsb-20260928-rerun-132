@@ -94,6 +94,22 @@ func (r *Registry) GlobalExisting(mod, name string) (*Symbol, bool) {
 	return s, ok
 }
 
+// Alias binds the module-qualified name to an already existing symbol, so a
+// re-export (a compatible entry under another module or name) keeps the
+// original identity instead of minting a new one. It reports false when the
+// key is already taken by a different symbol, which signals an export
+// conflict with a real declaration.
+func (r *Registry) Alias(mod, name string, target *Symbol) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := GlobalKey(mod, name)
+	if s, ok := r.globals[key]; ok {
+		return s == target
+	}
+	r.globals[key] = target
+	return true
+}
+
 // PruneGlobals drops module-qualified identities whose keys are not in live,
 // so declarations removed from the snapshot stop resolving elsewhere.
 func (r *Registry) PruneGlobals(live map[string]bool) {
@@ -117,6 +133,28 @@ func (r *Registry) Local(key, name string, kind Kind) *Symbol {
 	s := &Symbol{ID: r.nextID, Kind: kind, Name: name, LocalKey: key}
 	r.locals[key] = s
 	return s
+}
+
+// MoveKey re-keys a global identity from one module-qualified name to
+// another, preserving the symbol (and its ID) across a declaration
+// migration. It is a no-op when the old key is absent or the new key is
+// already taken by a different symbol.
+func (r *Registry) MoveKey(oldMod, oldName, newMod, newName string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	oldKey := GlobalKey(oldMod, oldName)
+	newKey := GlobalKey(newMod, newName)
+	s, ok := r.globals[oldKey]
+	if !ok {
+		return
+	}
+	if existing, taken := r.globals[newKey]; taken && existing != s {
+		return
+	}
+	delete(r.globals, oldKey)
+	s.Module = newMod
+	s.Name = newName
+	r.globals[newKey] = s
 }
 
 // LocalKey builds the identity key of a local declaration.

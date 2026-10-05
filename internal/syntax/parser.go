@@ -134,6 +134,42 @@ func pathBase(path string) string {
 	return path
 }
 
+// ModulePath returns the module path declared by the file's module
+// directive, or "" for an anonymous-world document.
+func ModulePath(f *File) string {
+	if f == nil {
+		return ""
+	}
+	for _, s := range f.Stmts {
+		if m, ok := s.(*ModuleStmt); ok {
+			return m.Path
+		}
+	}
+	return ""
+}
+
+// Imports maps every import alias of the file to the module path it binds.
+// The alias is the explicit 'as' name when present, otherwise the final
+// path component.
+func Imports(f *File) map[string]string {
+	out := map[string]string{}
+	if f == nil {
+		return out
+	}
+	for _, s := range f.Stmts {
+		imp, ok := s.(*ImportStmt)
+		if !ok {
+			continue
+		}
+		alias := imp.Alias
+		if !imp.HasAlias {
+			alias = pathBase(imp.Path)
+		}
+		out[alias] = imp.Path
+	}
+	return out
+}
+
 func (p *parser) parseModule() (*ModuleStmt, error) {
 	start := p.next() // 'module'
 	lit, err := p.want(tokString, "")
@@ -457,7 +493,7 @@ func (p *parser) parseCall(fun Expr) (*CallExpr, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.Range = span(fun.Range, close.r)
+	c.Range = span(fun.nodeRange(), close.r)
 	return c, nil
 }
 
