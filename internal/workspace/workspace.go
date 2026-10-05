@@ -83,6 +83,7 @@ type Workspace struct {
 	reg       *semantic.Registry
 	files     map[snapshot.URI]*fileState
 	parseErrs map[snapshot.URI]error
+	moveUndo  []moveUndo
 }
 
 // New creates an empty workspace.
@@ -163,7 +164,7 @@ func (w *Workspace) rebuild(changed snapshot.URI) {
 		oldTree = st.tree
 	}
 	affected := map[string]bool{}
-	for _, n := range globalNames(oldTree) {
+	for _, n := range globalKeys(oldTree) {
 		affected[n] = true
 	}
 	tree, err := syntax.Parse(doc.Text)
@@ -172,14 +173,15 @@ func (w *Workspace) rebuild(changed snapshot.URI) {
 		w.parseErrs[changed] = err
 	} else {
 		delete(w.parseErrs, changed)
-		for _, n := range globalNames(tree) {
+		for _, n := range globalKeys(tree) {
 			affected[n] = true
 		}
 	}
 
 	// Pass 1 (syntax only): register every project-global name and kind from
 	// every parseable file. This makes mutual references resolvable regardless
-	// of declaration order and across files.
+	// of declaration order and across files. Names are module-qualified; export
+	// aliases stay live so their identity survives pruning.
 	live := map[string]bool{}
 	for _, u := range w.snapshot().URIs() {
 		st := w.files[u]
@@ -195,14 +197,21 @@ func (w *Workspace) rebuild(changed snapshot.URI) {
 		if t == nil {
 			continue
 		}
+		mod := moduleOf(t)
 		for _, s := range t.Stmts {
 			switch n := s.(type) {
 			case *syntax.FnStmt:
-				w.reg.Global(n.Name, semantic.KindFunc)
-				live[n.Name] = true
+				w.reg.Global(mod, n.Name, semantic.KindFunc)
+				live[semantic.GlobalKey(mod, n.Name)] = true
 			case *syntax.LetStmt:
-				w.reg.Global(n.Name, semantic.KindVar)
-				live[n.Name] = true
+				w.reg.Global(mod, n.Name, semantic.KindVar)
+				live[semantic.GlobalKey(mod, n.Name)] = true
+			case *syntax.ExportStmt:
+				ext := n.Local
+				if n.HasExternal {
+					ext = n.External
+				}
+				live[semantic.GlobalKey(mod, ext)] = true
 			}
 		}
 	}
@@ -234,17 +243,37 @@ func (w *Workspace) rebuild(changed snapshot.URI) {
 	}
 }
 
-func globalNames(t *syntax.File) []string {
+// moduleOf returns the module path a parsed file belongs to ("" for the
+// anonymous world).
+func moduleOf(t *syntax.File) string {
+	for _, s := range t.Stmts {
+		if m, ok := s.(*syntax.ModuleStmt); ok {
+			return m.Path
+		}
+	}
+	return ""
+}
+
+// globalKeys lists the module-qualified identity keys a file contributes:
+// its top-level declarations plus its re-export aliases.
+func globalKeys(t *syntax.File) []string {
 	if t == nil {
 		return nil
 	}
+	mod := moduleOf(t)
 	var names []string
 	for _, s := range t.Stmts {
 		switch n := s.(type) {
 		case *syntax.FnStmt:
-			names = append(names, n.Name)
+			names = append(names, semantic.GlobalKey(mod, n.Name))
 		case *syntax.LetStmt:
-			names = append(names, n.Name)
+			names = append(names, semantic.GlobalKey(mod, n.Name))
+		case *syntax.ExportStmt:
+			ext := n.Local
+			if n.HasExternal {
+				ext = n.External
+			}
+			names = append(names, semantic.GlobalKey(mod, ext))
 		}
 	}
 	return names
@@ -252,11 +281,29 @@ func globalNames(t *syntax.File) []string {
 
 func mentionsAny(a *semantic.FileAnalysis, names map[string]bool) bool {
 	for _, o := range a.Occurrences {
-		if names[o.Symbol.Name] {
+		if names[semantic.GlobalKey(o.Symbol.Module, o.Symbol.Name)] {
 			return true
 		}
 	}
 	return false
+}
+
+// reanalyzeAll re-runs semantic binding for every parsed file against the
+// current registry. Structural operations (declaration moves and their
+// undo) use it after the per-file rebuilds, because alias keys and moved
+// declarations shift resolution in files that were never textually touched.
+func (w *Workspace) reanalyzeAll() {
+	for u, st := range w.files {
+		if st == nil {
+			continue
+		}
+		a, err := semantic.AnalyzeFile(w.reg, st.doc, st.tree)
+		if err != nil {
+			w.parseErrs[u] = err
+			continue
+		}
+		st.analysis = a
+	}
 }
 
 func (w *Workspace) versionInfoLocked() VersionInfo {

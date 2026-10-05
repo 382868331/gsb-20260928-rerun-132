@@ -136,3 +136,64 @@ func TestHTTPRenamePreviewApplyAndStale(t *testing.T) {
 		}
 	}
 }
+
+// Move migration over HTTP: prepare -> apply -> definition through the
+// compat entry -> undo -> definition back on the original declaration.
+func TestHTTPMoveMigrationAndUndo(t *testing.T) {
+	h := server.New(workspace.New()).Mux()
+
+	core := "module \"core\"\n\nfn helper(x) {\n  return x + 1\n}\n"
+	util := "module \"util\"\n\nfn other() {\n  return 0\n}\n"
+	app := "module \"app\"\n\nimport \"core\"\n\nfn main() {\n  return core.helper(2)\n}\n"
+	for uri, text := range map[string]string{
+		"file:///core.edu": core,
+		"file:///util.edu": util,
+		"file:///app.edu":  app,
+	} {
+		if code, _ := post(t, h, "/open", map[string]any{
+			"uri": uri, "text": text, "version": 1, "saved": true,
+		}); code != http.StatusOK {
+			t.Fatalf("open %s status %d", uri, code)
+		}
+	}
+
+	code, plan := post(t, h, "/move/prepare", map[string]any{
+		"uri": "file:///core.edu", "offset": strings.Index(core, "helper"),
+		"targetUri": "file:///util.edu", "newName": "assist",
+		"keepUris": []string{"file:///app.edu"},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("move/prepare status %d: %v", code, plan)
+	}
+	code, applied := post(t, h, "/move/apply", plan)
+	if code != http.StatusOK {
+		t.Fatalf("move/apply status %d: %v", code, applied)
+	}
+
+	// The retained core.helper reference resolves into util.edu.
+	code, def := post(t, h, "/definition", map[string]any{
+		"uri": "file:///app.edu", "offset": strings.Index(app, "core.helper") + len("core."),
+	})
+	if code != http.StatusOK {
+		t.Fatalf("definition status %d: %v", code, def)
+	}
+	loc, _ := def["location"].(map[string]any)
+	if loc == nil || loc["uri"] != "file:///util.edu" {
+		t.Fatalf("compat entry should resolve into util.edu: %v", def)
+	}
+
+	// Undo restores the original declaration site.
+	if code, out := post(t, h, "/move/undo", map[string]any{}); code != http.StatusOK {
+		t.Fatalf("move/undo status %d: %v", code, out)
+	}
+	code, def = post(t, h, "/definition", map[string]any{
+		"uri": "file:///app.edu", "offset": strings.Index(app, "core.helper") + len("core."),
+	})
+	if code != http.StatusOK {
+		t.Fatalf("definition after undo status %d: %v", code, def)
+	}
+	loc, _ = def["location"].(map[string]any)
+	if loc == nil || loc["uri"] != "file:///core.edu" {
+		t.Fatalf("after undo helper should be back in core.edu: %v", def)
+	}
+}

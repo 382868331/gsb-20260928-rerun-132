@@ -5,6 +5,9 @@
 - 跨文件 **定义跳转（definition）**
 - 跨文件 **引用定位（references）**
  - 跨文件 **带预览的重命名（rename）**：先预览、确认后原子落笔
+- 跨文件 **声明迁移（move）**：把顶层声明搬到另一个文件并可同时改名，
+  选定保留的引用通过源文件里的兼容入口（import + export 别名）继续解析；
+  迁移可撤销，逐字节恢复原声明、引用与文件状态
 
 它不是代码片段管理器：存储的是版本化的工程快照、语法对象和符号身份，
 后续补全/重命名等能力直接建立在此基础上。
@@ -70,10 +73,29 @@ fn main() {
 - `POST /definition` `{uri,offset}` 返回符号身份与声明位置
 - `POST /references` `{uri,offset}` 返回声明 + 全部引用位置
  - `POST /diagnostics` `{uri}` 返回该文档的语义诊断
- - `POST /rename/prepare` `{uri,offset,newName}` 生成重命名预览方案（不改任何文本）
- - `POST /rename/apply` 传入预览方案整体，校验通过后原子应用；方案过期返回 409
+- `POST /rename/prepare` `{uri,offset,newName}` 生成重命名预览方案（不改任何文本）
+- `POST /rename/apply` 传入预览方案整体，校验通过后原子应用；方案过期返回 409
+- `POST /move/prepare` `{uri,offset,targetUri,newName,keepUris}` 生成声明迁移预览：
+  顶层声明移入 `targetUri` 并改名为 `newName`（空则保持原名）；`keepUris`
+  中的文件引用保持原文不变
+- `POST /move/apply` 传入迁移方案整体，逐文档校验版本与原文后原子应用；过期返回 409
+- `POST /move/undo` 撤销最近一次迁移，恢复全部触及文档的文本、版本与保存状态
 - `GET /status` 返回快照 ID、各文档版本/保存状态
 - `GET /health`
+
+## 模块与声明迁移
+
+- **模块指令**：文件首条语句可为 `module "a.b"`；无指令的文件属于匿名世界，
+  顶层名仍是工程级裸名（与第一版一致）。
+- **导入与限定名**：`import "a.b" [as x]` 绑定模块限定符，`x.name` 解析到
+  该模块导出的符号；限定符绝不能指向局部变量。
+- **再导出**：`export local [as external]` 把本文件可见的名字（自身顶层声明
+  或已导入模块的导出）以同一符号身份别名出去——消费方绑定的是原声明，不是副本。
+- **迁移兼容入口**：声明跨文件移动（尤其改名）时，`keepUris` 里选定保留的
+  引用不改写；源文件自动补上 `import` + `export new as old` 兼容入口，
+  旧的限定名/裸名继续解析到已迁移的符号。
+- **撤销**：每次迁移落笔前记录触及文档的完整状态；`/move/undo` 校验迁移后
+  无人再改动这些文档，然后逐字节恢复原文、版本号与保存标记。
 
 位置对象示例：
 

@@ -159,9 +159,8 @@ func (p *parser) parseImport() (*ImportStmt, error) {
 		return nil, fmt.Errorf("syntax error at line %d col %d: %v", lit.r.StartLine, lit.r.StartColumn, err)
 	}
 	s := &ImportStmt{Range: span(start.r, lit.r), Path: path, PathRange: lit.r}
-	if p.peek().kind == tokKeyword && p.peek().value == "as" {
-		// 'as' is a contextual keyword here so it stays usable as an identifier.
-	} else if p.peek().kind == tokIdent && p.peek().value == "as" {
+	// 'as' is a contextual keyword here so it stays usable as an identifier.
+	if p.peek().kind == tokIdent && p.peek().value == "as" {
 		p.next()
 		alias, err := p.want(tokIdent, "")
 		if err != nil {
@@ -457,7 +456,7 @@ func (p *parser) parseCall(fun Expr) (*CallExpr, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.Range = span(fun.Range, close.r)
+	c.Range = span(fun.nodeRange(), close.r)
 	return c, nil
 }
 

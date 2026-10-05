@@ -96,7 +96,7 @@ func (w *Workspace) PrepareRename(uri snapshot.URI, offset int, newName string) 
 	// reject any registered global identity with that name, even if its only
 	// occurrences sit in untouched files.
 	if target.Symbol.LocalKey == "" {
-		if _, exists := w.reg.GlobalExisting(newName); exists {
+		if _, exists := w.reg.GlobalExisting(target.Symbol.Module, newName); exists {
 			return RenamePlan{}, fmt.Errorf("name %q already denotes a project-global symbol", newName)
 		}
 	}

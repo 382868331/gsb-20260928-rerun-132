@@ -50,6 +50,7 @@ type Registry struct {
 	nextID  uint64
 	globals map[string]*Symbol // name -> stable identity (whole project)
 	locals  map[string]*Symbol // localKey -> stable identity
+	aliases map[string]bool    // global keys bound by re-export, not declaration
 }
 
 // NewRegistry creates an empty registry.
@@ -57,6 +58,7 @@ func NewRegistry() *Registry {
 	return &Registry{
 		globals: make(map[string]*Symbol),
 		locals:  make(map[string]*Symbol),
+		aliases: make(map[string]bool),
 	}
 }
 
@@ -74,6 +76,12 @@ func (r *Registry) Global(mod, name string, kind Kind) *Symbol {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	key := GlobalKey(mod, name)
+	if r.aliases[key] {
+		// A real declaration reclaims the key from a re-export alias (e.g.
+		// after a moved declaration is moved back).
+		delete(r.globals, key)
+		delete(r.aliases, key)
+	}
 	if s, ok := r.globals[key]; ok {
 		if s.Kind == KindUnknown {
 			s.Kind = kind
@@ -102,8 +110,19 @@ func (r *Registry) PruneGlobals(live map[string]bool) {
 	for key := range r.globals {
 		if !live[key] {
 			delete(r.globals, key)
+			delete(r.aliases, key)
 		}
 	}
+}
+
+// Alias binds an existing symbol to an additional module-qualified key. It
+// backs re-exports: the alias key and the original key resolve to one shared
+// identity, never to a copy.
+func (r *Registry) Alias(key string, sym *Symbol) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.globals[key] = sym
+	r.aliases[key] = true
 }
 
 // Local returns the stable local symbol for a lexical identity key.

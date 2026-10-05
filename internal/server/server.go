@@ -31,6 +31,9 @@ func (s *Server) Mux() http.Handler {
 	mux.HandleFunc("POST /diagnostics", s.diagnostics)
 	mux.HandleFunc("POST /rename/prepare", s.renamePrepare)
 	mux.HandleFunc("POST /rename/apply", s.renameApply)
+	mux.HandleFunc("POST /move/prepare", s.movePrepare)
+	mux.HandleFunc("POST /move/apply", s.moveApply)
+	mux.HandleFunc("POST /move/undo", s.moveUndo)
 	return mux
 }
 
@@ -127,6 +130,57 @@ type renamePrepareReq struct {
 	URI     string `json:"uri"`
 	Offset  int    `json:"offset"`
 	NewName string `json:"newName"`
+}
+
+type movePrepareReq struct {
+	URI       string   `json:"uri"`
+	Offset    int      `json:"offset"`
+	TargetURI string   `json:"targetUri"`
+	NewName   string   `json:"newName"`
+	KeepURIs  []string `json:"keepUris"`
+}
+
+func (s *Server) movePrepare(w http.ResponseWriter, r *http.Request) {
+	var req movePrepareReq
+	if !decode(w, r, &req) {
+		return
+	}
+	var keep []snapshot.URI
+	for _, k := range req.KeepURIs {
+		keep = append(keep, snapshot.URI(k))
+	}
+	plan, err := s.ws.PrepareMove(snapshot.URI(req.URI), req.Offset, snapshot.URI(req.TargetURI), req.NewName, keep)
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, plan)
+}
+
+func (s *Server) moveApply(w http.ResponseWriter, r *http.Request) {
+	var plan workspace.MovePlan
+	if !decode(w, r, &plan) {
+		return
+	}
+	res, err := s.ws.ApplyMove(plan)
+	if err != nil {
+		if errors.Is(err, workspace.ErrStaleMovePlan) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
+		writeError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) moveUndo(w http.ResponseWriter, r *http.Request) {
+	vi, err := s.ws.UndoMove()
+	if err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, vi)
 }
 
 func (s *Server) renamePrepare(w http.ResponseWriter, r *http.Request) {
